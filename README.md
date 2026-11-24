@@ -1,11 +1,14 @@
 # data-qd-207 · 地震到时事件归并与波形复核目录
 
-把多台站P/S到时按显式时间窗归并为事件，并保留台站与相位证据；不定位震源。
+把多台站P/S到时按显式时间窗归并为事件，并保留台站与相位证据；`process`
+本身不选择震源位置。另提供纯计算的候选震源位置诊断：在给定区域旅行时表下估计
+候选发震时刻、逐台站/逐到时残差，并给出 `usable`、`ambiguous`、
+`insufficient_evidence` 或 `unresolved` 的下游准入结论。
 另提供**可重开的本地波形复核目录**：用版本化台站校时生成事件与取样计划，
 登记中心归档回执并安全决定原始波形块下线；目录只登记数据引用，不传输、
 解码或删除波形文件。
 
-本仓主要交付是Python业务API和可供下游使用的结构化数据，不是通用CLI、报表或CRUD模板。字段、身份、单位、上限与失败边界见 [数据契约](docs/contract.md)；复核目录的输入、来源查询、幂等重放与崩溃重开语义见 [复核目录契约](docs/review-contract.md)。训练/盲测数据集发布账本、波形引用清单与重开幂等契约见 [数据集发布账本契约](docs/dataset-release.md)。跨校时版本的稳定事件目录身份 `ceN`、全局继承选择与谱系 API 见 [事件目录身份契约](docs/event-catalog.md)。样本级特征血缘、副本/物理两类缺陷传播与交付凭证见 [特征血缘与交付凭证契约](docs/feature-lineage.md)。
+本仓主要交付是Python业务API和可供下游使用的结构化数据，不是通用CLI、报表或CRUD模板。字段、身份、单位、上限与失败边界见 [数据契约](docs/contract.md)；候选位置、残差证据、歧义与定位目录准入见 [候选震源位置契约](docs/location-contract.md)。复核目录的输入、来源查询、幂等重放与崩溃重开语义见 [复核目录契约](docs/review-contract.md)。训练/盲测数据集发布账本、波形引用清单与重开幂等契约见 [数据集发布账本契约](docs/dataset-release.md)。跨校时版本的稳定事件目录身份 `ceN`、全局继承选择与谱系 API 见 [事件目录身份契约](docs/event-catalog.md)。样本级特征血缘、副本/物理两类缺陷传播与交付凭证见 [特征血缘与交付凭证契约](docs/feature-lineage.md)。
 
 ## 安装与验证
 
@@ -18,6 +21,7 @@ uv pip install --offline --python .venv/bin/python --no-build-isolation --no-dep
 uv pip check --python .venv/bin/python
 .venv/bin/python -I -m unittest discover -s tests -v
 .venv/bin/python -I examples/run_sample.py
+.venv/bin/python -I examples/run_location_evaluation.py
 .venv/bin/python -I examples/run_review.py
 .venv/bin/python -I examples/run_event_catalog.py
 ```
@@ -37,6 +41,26 @@ from seismic_assoc import process
 from seismic_assoc.io import load, publish
 publish("run/another.json", process(load("fixtures/input.json")))
 ```
+
+候选位置诊断不使用归并 `anchor` 作为发震时刻；它按“到时−旅行时”的台站中位数、
+台站等权中位数估计每个候选的 `origin_time`，再计算残差、支持站和歧义：
+
+```python
+from seismic_assoc import evaluate_location_candidates
+
+report = evaluate_location_candidates(
+    process_result, station_coordinates, candidates,
+    {"residual_threshold": 0.1,
+     "min_supporting_stations": 3,
+     "ambiguity_margin": 0.05},
+)
+for event in report["events"]:
+    print(event["event_id"], event["status"], event["best_candidate_id"])
+```
+
+完整字段、原因码、排序和边界语义见
+[候选震源位置契约](docs/location-contract.md)，可运行示例见
+`examples/run_location_evaluation.py`。
 
 复核目录的最小调用形态（完整合成示例见 `examples/run_review.py`）：
 
@@ -85,7 +109,8 @@ catalog = reconcile_event_catalog(catalog, d)     # 紧接处理下一校时版
 {"arrivals": 3, "events": 2, "multi_station": 1}
 ```
 
-现有 66 项测试全部通过（含 7 项旧入口回归、复核目录验收/边界/崩溃重开
+现有 105 项测试全部通过（含候选震源位置的 23 项验收/边界/拒绝路径用例、
+7 项旧入口回归、复核目录验收/边界/崩溃重开
 用例、8 项数据集发布账本验收/API 兼容用例，以及事件目录身份的规范键分配、
 全局选择、谱系、别名兼容、随机分区不变量与拒绝路径用例），并核对非法输入拒绝；
 样例数据全部原创合成，见 [来源](fixtures/SOURCES.md)。
