@@ -24,6 +24,13 @@ from fractions import Fraction
 from pathlib import Path
 
 from .checks import array, fields, fraction_str, ident, integer, number
+from .lineage import (
+    MAX_FEATURE_DEPTH,
+    MAX_NODE_LENGTH,
+    LineageStore,
+    UnknownCertificateError,
+    UnknownNodeError,
+)
 
 _MAX_BLOCKS = 2000
 _MAX_SEGMENTS = 128
@@ -32,6 +39,8 @@ _MAX_ARRIVALS = 2000
 
 RELEASE_PREVIEW_SCHEMA = 'seismic-assoc.release-preview/v1'
 RELEASE_MANIFEST_SCHEMA = 'seismic-assoc.release-manifest/v1'
+FEATURE_NODE_SCHEMA = 'seismic-assoc.feature-node/v1'
+FEATURE_CERTIFICATE_SCHEMA = 'seismic-assoc.feature-certificate/v1'
 
 
 class ReleaseRequestError(ValueError):
@@ -54,6 +63,11 @@ def _ival(value):
     if lo >= hi:
         raise ValueError('interval must be non-empty and half-open [lo,hi)')
     return lo, hi
+
+
+def _bounded_int(value, low, high):
+    """严格整数（拒绝 bool）且落在闭区间 [low, high] 内。"""
+    return integer(value, low, high)
 
 
 def _fraction_key(value):
@@ -334,6 +348,7 @@ def create_review(path, data, first_version):
     directory._offline = {}
     directory._responses = {}
     directory._init_release_state()
+    directory._init_lineage()
     directory._current = None
     directory._seq = 0
     directory._journal = open(target / 'journal.log', 'a+b')
@@ -384,6 +399,7 @@ def open_review(path):
         directory._offline = {}
         directory._responses = {}
         directory._init_release_state()
+        directory._init_lineage()
         directory._current = None
         directory._seq = 0
         journal_path = target / 'journal.log'
@@ -459,6 +475,10 @@ class ReviewDirectory:
         self._releases = {}
         self._release_usage = {'train': {}, 'blind': {}}
 
+    def _init_lineage(self):
+        """样本级血缘、缺陷与凭证的内存派生状态；journal 仍是唯一事实来源。"""
+        self._lineage = LineageStore()
+
     def _directory_key(self):
         return str(self._path.resolve())
 
@@ -502,6 +522,14 @@ class ReviewDirectory:
                          for rid, rec in sorted(self._receipts.items())},
             'offline': {bid: {'request_id': rec['request_id']}
                         for bid, rec in sorted(self._offline.items())},
+            # 血缘派生摘要（journal 仍是唯一事实来源）：让 state.json 自身
+            # 也能反映新能力的存在与计数，重开时一律以 journal 重放为准。
+            'feature_lineage': {
+                'raw_node_count': self._lineage.raw_count,
+                'feature_node_count': self._lineage.feature_count,
+                'defect_count': len(self._lineage.defects),
+                'certificate_count': len(self._lineage.certificates),
+            },
         }
         self._atomic_write('state.json', state)
 
@@ -581,6 +609,27 @@ class ReviewDirectory:
             manifest = entry['response']
             self._releases[rid] = {'payload': entry['payload'], 'manifest': manifest}
             self._apply_release_usage(manifest)
+        elif kind == 'raw_node':
+            node = dict(entry['payload'])
+            node['interval'] = tuple(node['interval'])
+            node['fragments'] = [
+                {**frag, 'interval': tuple(frag['interval'])}
+                for frag in node['fragments']]
+            self._lineage.add_raw_node(node)
+        elif kind == 'feature_node':
+            node = dict(entry['payload'])
+            node['parents'] = [dict(parent) for parent in node['parents']]
+            self._lineage.add_feature_node(node)
+        elif kind == 'defect':
+            defect = dict(entry['payload'])
+            defect['interval'] = tuple(defect['interval'])
+            self._lineage.add_defect(defect)
+        elif kind == 'certificate':
+            cert = dict(entry['response'])
+            cert['selections'] = [
+                {**sel, 'intervals': [tuple(iv) for iv in sel['intervals']]}
+                for sel in cert['selections']]
+            self._lineage.add_certificate(cert)
         self._responses[(kind, rid)] = entry['response']
 
     # ---------- 校时版本 ----------
@@ -736,11 +785,19 @@ class ReviewDirectory:
         needed = [(max(lo, blo), min(hi, bhi)) for lo, hi in needed
                   if lo < bhi and hi > blo]
         needed = _merge(needed)
-        archived = _merge([rec['interval'] for rec in self._receipts.values()
-                           if rec['block_id'] == bid])
+        # 归档覆盖必须完好：副本缺陷片段要先扣除，损坏部分不满足下线归档义务。
+        archived = []
+        for rec in self._receipts.values():
+            if rec['block_id'] != bid:
+                continue
+            for hlo, hhi in self._lineage.healthy_receipt_pieces(
+                    rec['receipt_id'], rec['interval']):
+                archived.append((hlo, hhi))
+        archived = _merge(archived)
         for lo, hi in needed:
             if not any(alo <= lo and hi <= ahi for alo, ahi in archived):
-                raise ValueError('block still has required samples without archive; refused')
+                raise ValueError('block still has required samples without healthy '
+                                 'archive; refused')
         payload = {'block_id': bid}
         response = {'request_id': qid, 'approved': True, 'block_id': bid}
         self._append_journal('offline', qid, payload, response)
@@ -933,6 +990,11 @@ class ReviewDirectory:
                 gaps, online_gaps, missing_gaps = self._archive_gaps(required)
             else:
                 gaps = online_gaps = missing_gaps = []
+            # 物理质量缺陷是科学数据无效，独立于归档可读性缺口：不改变
+            # query_sources 的 archive/online/missing 分类，只单独列出并
+            # 在首次发布时整笔拒绝；预览不裁掉坏样本，候选分组保持原样。
+            physical_issues = self._physical_quality_issues(required)
+            physical_intervals = [item['interval'] for item in physical_issues]
 
             group = {
                 'id': key,
@@ -1017,6 +1079,10 @@ class ReviewDirectory:
                     'missing_gaps': missing_gaps,
                     'missing': missing_gaps,
                     'missing_ranges': missing_gaps,
+                    'physical_quality_defects': physical_issues,
+                    'physical_defects': physical_issues,
+                    'physical_quality_intervals': physical_intervals,
+                    'has_physical_quality_defect': bool(physical_issues),
                     'has_archive_gaps': bool(gaps),
                     'archive_complete': not gaps,
                     'deliverable': not gaps,
@@ -1050,6 +1116,10 @@ class ReviewDirectory:
                     'missing_gaps': missing_gaps,
                     'missing': missing_gaps,
                     'missing_ranges': missing_gaps,
+                    'physical_quality_defects': physical_issues,
+                    'physical_defects': physical_issues,
+                    'physical_quality_intervals': physical_intervals,
+                    'has_physical_quality_defect': bool(physical_issues),
                     'has_archive_gaps': bool(gaps),
                     'archive_complete': not gaps,
                     'deliverable': not gaps,
@@ -1091,6 +1161,28 @@ class ReviewDirectory:
             'has_conflict': any(g['conflict'] for g in groups),
         }
         return preview
+
+    def _physical_quality_issues(self, required):
+        """列出批准组所需区间与物理采样缺陷的交集，逐缺陷保留原因。"""
+        from .lineage import intersect_intervals
+        issues = []
+        for station in sorted(required):
+            for defect in self._lineage.defects:
+                if defect['scope'] != 'physical' or defect['target'] != station:
+                    continue
+                hits = intersect_intervals(
+                    [tuple(iv) for iv in required[station]],
+                    [tuple(defect['interval'])])
+                for lo, hi in hits:
+                    issues.append({
+                        'station': station,
+                        'interval': [lo, hi],
+                        'range': [lo, hi],
+                        'defect_request_id': defect['request_id'],
+                        'request_id': defect['request_id'],
+                        'kind': 'physical_quality_defect',
+                    })
+        return issues
 
     def _archive_gaps(self, required):
         gaps = []
@@ -1427,6 +1519,17 @@ class ReviewDirectory:
                 raise ReleaseRequestError(
                     f"approved group {group['group_key']} usage changed from "
                     f"{approved_usage} to {group.get('usage')}; issue a new preview")
+            # 首次成功发布必须拒绝任何含物理采样质量缺陷的批准组；副本损坏
+            # 已在 _classify 中表现为 online/missing 归档缺口，可换完好副本后
+            # 重试，物理缺陷则不能靠换回执或裁剪事件范围绕过。
+            if group.get('has_physical_quality_defect'):
+                details = ', '.join(
+                    f"{item['station']}[{item['interval'][0]},{item['interval'][1]})"
+                    f"<-{item['defect_request_id']}"
+                    for item in group['physical_quality_defects'])
+                raise ReleaseRequestError(
+                    f"refuse release {rid}: group {group['group_key']} contains "
+                    f"physically invalid samples: {details}")
             approved.append(group)
 
         manifest = self._build_release_manifest(
@@ -1715,11 +1818,21 @@ class ReviewDirectory:
         out = []
         for blo, bhi, bid in block_ivs:
             seg_lo, seg_hi = max(lo, blo), min(hi, bhi)
-            arch = [(max(rec['interval'][0], seg_lo), min(rec['interval'][1], seg_hi),
-                     rec['receipt_id'])
-                    for rec in receipts
-                    if rec['block_id'] == bid
-                    and rec['interval'][0] < seg_hi and rec['interval'][1] > seg_lo]
+            # 副本缺陷按区间排除：先把每份回执切成其完好片段，再参与覆盖竞争；
+            # 不会因一小段损坏而舍弃整张回执。物理质量缺陷不改变副本可读性，
+            # 因此不在这里扣除（它在发布/凭证环节单独裁决）。
+            arch = []
+            for rec in receipts:
+                if rec['block_id'] != bid:
+                    continue
+                clipped = (max(rec['interval'][0], seg_lo),
+                           min(rec['interval'][1], seg_hi))
+                if clipped[0] >= seg_hi or clipped[1] <= seg_lo:
+                    continue
+                for hlo, hhi in self._lineage.healthy_receipt_pieces(
+                        rec['receipt_id'], clipped):
+                    if hlo < seg_hi and hhi > seg_lo:
+                        arch.append((hlo, hhi, rec['receipt_id']))
             # 边界扫描：每个子区间选覆盖它的字典序最小回执，不枚举采样点
             boundaries = sorted({seg_lo, seg_hi} |
                                 {x for alo, ahi, _ in arch for x in (alo, ahi)})
@@ -1743,6 +1856,556 @@ class ReviewDirectory:
         out.extend((iv, 'missing', None) for iv in missing)
         out.sort(key=lambda item: (item[0][0], item[0][1], item[1], item[2] or ''))
         return out
+
+    # ---------- 样本级特征血缘：原始输入节点 ----------
+
+    def _published_group(self, release_request_id, group_key):
+        record = self._releases.get(ident(release_request_id))
+        if record is None:
+            raise ValueError('unknown release_request_id; reference a release '
+                             'successfully published in this directory')
+        for group in record['manifest'].get('groups', []):
+            if group.get('group_key') == ident(group_key):
+                return record, group
+        raise ValueError('unknown group_key in the referenced release')
+
+    def _group_usage(self, group):
+        usage = _canonical_usage(
+            group.get('usage') or group.get('treatment') or group.get('status'))
+        if usage not in ('train', 'blind'):
+            raise ValueError('referenced release group has no train/blind usage')
+        return usage
+
+    def capture_waveform_input(self, request):
+        """重新实际取数并固定一个原始输入节点（不读波形数值）。
+
+        完整调用示例::
+
+            d.capture_waveform_input({
+                "node_id": "R",
+                "release_request_id": "pub1",
+                "group_key": "e1",
+                "station": "A",
+                "interval": [100, 120],
+            })
+
+        规则：区间必须全部属于已发布组在该站的 ``sample_unions``，不允许借
+        组外事件扩张；只能选当前完好的归档副本（重叠片段取回执 ID 字典序
+        最小者），在线原块不兜底；物理采样缺陷或任何不能全段归档交付的片
+        段都会整笔拒绝。成功后节点实际来源永久固定，重取不修改原发布清单。
+        """
+        self._check_open()
+        fields(request, ('node_id', 'release_request_id', 'group_key',
+                         'station', 'interval'))
+        node_id = ident(request['node_id'])
+        if node_id in self._lineage.nodes:
+            existing = self._lineage.nodes[node_id]
+            if existing['kind'] != 'raw':
+                raise ValueError('node id already defined; node ids cannot be redefined')
+            return self._replay_raw_node(node_id, request)
+        group_key = ident(request['group_key'])
+        station = ident(request['station'])
+        lo, hi = _ival(request['interval'])
+        record, group = self._published_group(
+            request['release_request_id'], group_key)
+        release_id = ident(request['release_request_id'])
+        if station not in group.get('sample_unions', {}):
+            raise ValueError('station is not part of the referenced release group')
+        unions = [tuple(iv) for iv in group['sample_unions'][station]]
+        if not any(ulo <= lo and hi <= uhi for ulo, uhi in unions):
+            raise ValueError('interval must lie entirely inside the group sample_unions '
+                             'for that station; no expansion via events outside the group')
+        if station not in self._domains:
+            raise ValueError('unknown station')
+        if not self._domains[station][0] <= lo < hi <= self._domains[station][1]:
+            raise ValueError('interval outside station sampling domain')
+        # 物理采样缺陷：科学数据无效，不能靠换副本或假装存储缺失绕过。
+        if self._lineage.has_physical_defect(station, [(lo, hi)]):
+            raise ValueError('refuse capture: requested interval contains physically '
+                             'invalid samples')
+        # 只允许当前完好归档；_classify 已扣除副本缺陷片段并按字典序选回执，
+        # online/missing 片段一律拒绝，不做在线原块兜底。
+        pieces = self._classify(station, lo, hi)
+        if any(kind != 'archive' for _, kind, _ in pieces):
+            raise ValueError('refuse capture: interval cannot be delivered entirely '
+                             'from healthy archived copies')
+        covered = _merge(iv for iv, _, _ in pieces)
+        if covered != [(lo, hi)]:
+            raise ValueError('refuse capture: archived coverage is not a complete '
+                             'partition of the requested interval')
+        fragments = []
+        for (flo, fhi), _, receipt_id in pieces:
+            receipt = self._receipts[receipt_id]
+            fragments.append({
+                'receipt_id': receipt_id,
+                'block_id': receipt['block_id'],
+                'interval': [flo, fhi],
+            })
+        usage = self._group_usage(group)
+        payload = {
+            'node_id': node_id,
+            'kind': 'raw',
+            'station': station,
+            'interval': [lo, hi],
+            'length': hi - lo,
+            'fragments': fragments,
+            'release_request_id': release_id,
+            'group_key': group_key,
+            'usage': usage,
+        }
+        response = {
+            'node_id': node_id,
+            'accepted': True,
+            'kind': 'raw',
+            'station': station,
+            'interval': [lo, hi],
+            'length': hi - lo,
+            'output_domain': [0, hi - lo],
+            'fragments': [dict(frag) for frag in fragments],
+            'release_request_id': release_id,
+            'group_key': group_key,
+            'usage': usage,
+        }
+        self._commit_lineage('raw_node', node_id, payload, response)
+        return _json_copy(response)
+
+    def _replay_raw_node(self, node_id, request):
+        stored = self._lineage.nodes[node_id]
+        candidate_key = {
+            'release_request_id': ident(request['release_request_id']),
+            'group_key': ident(request['group_key']),
+            'station': ident(request['station']),
+            'interval': list(_ival(request['interval'])),
+        }
+        stored_key = {
+            'release_request_id': stored['release_request_id'],
+            'group_key': stored['group_key'],
+            'station': stored['station'],
+            'interval': list(stored['interval']),
+        }
+        if _canonical(candidate_key) != _canonical(stored_key):
+            raise ValueError('node id reused with different capture input')
+        return _json_copy(self._responses[('raw_node', node_id)])
+
+    # ---------- 样本级特征血缘：特征节点 ----------
+
+    def register_window_feature(self, request):
+        """登记一个已生成滑窗特征的依赖声明（不实现/校验特征算法本身）。
+
+        完整调用示例::
+
+            d.register_window_feature({
+                "node_id": "F",
+                "length": 16,
+                "parents": [{"node_id": "R", "offset": 0, "width": 5}],
+            })
+
+        每个输出位置 ``i`` 同时依赖每个父节点的完整窗口
+        ``[i+offset, i+offset+width)``；窗口必须完整落在父输出域内，不截断、
+        不补零。一至两个不同父节点，深度最多四层，父项顺序无语义差别。
+        父节点用途必须一致，特征继承该用途。登记只记录依赖，父节点已局部
+        无效也允许登记，无效区间按窗口规则另行传播。
+        """
+        self._check_open()
+        fields(request, ('node_id', 'length', 'parents'))
+        node_id = ident(request['node_id'])
+        if node_id in self._lineage.nodes:
+            existing = self._lineage.nodes[node_id]
+            if existing['kind'] != 'feature':
+                raise ValueError('node id already defined; node ids cannot be redefined')
+            return self._replay_feature_node(node_id, request)
+        length = _bounded_int(request['length'], 1, MAX_NODE_LENGTH)
+        parents_in = array(request['parents'], 1, 2)
+        parents = []
+        parent_ids = []
+        max_depth = 0
+        usage = None
+        for raw_parent in parents_in:
+            fields(raw_parent, ('node_id', 'offset', 'width'))
+            parent_id = ident(raw_parent['node_id'])
+            if parent_id not in self._lineage.nodes:
+                raise ValueError(f'unknown parent node: {parent_id}')
+            parent_node = self._lineage.nodes[parent_id]
+            offset = _bounded_int(raw_parent['offset'], 0, MAX_NODE_LENGTH - 1)
+            width = _bounded_int(raw_parent['width'], 1, MAX_NODE_LENGTH)
+            # 每个输出位置 i 的窗口 [i+offset, i+offset+width) 必须完整在域内。
+            if length - 1 + offset + width > parent_node['length']:
+                raise ValueError(
+                    f'parent window exceeds parent output domain for {parent_id}')
+            if parent_node['usage'] is None:
+                raise ValueError('parent node has no inherited usage')
+            if usage is None:
+                usage = parent_node['usage']
+            elif parent_node['usage'] != usage:
+                raise ValueError('all parent nodes must share the same train/blind usage')
+            parents.append({'node_id': parent_id, 'offset': offset, 'width': width})
+            parent_ids.append(parent_id)
+            max_depth = max(max_depth, parent_node.get('depth', 0))
+        if len(set(parent_ids)) != len(parent_ids):
+            raise ValueError('duplicate parent entries are not allowed')
+        depth = max_depth + 1
+        if depth > MAX_FEATURE_DEPTH:
+            raise ValueError(f'feature depth must not exceed {MAX_FEATURE_DEPTH}')
+        # 父项顺序不构成语义差别：规范化排序后重放等价性与声明内容都稳定。
+        parents.sort(key=lambda parent: parent['node_id'])
+        payload = {
+            'node_id': node_id,
+            'kind': 'feature',
+            'length': length,
+            'parents': parents,
+            'depth': depth,
+            'usage': usage,
+        }
+        response = {
+            'node_id': node_id,
+            'accepted': True,
+            'kind': 'feature',
+            'length': length,
+            'output_domain': [0, length],
+            'parents': [dict(parent) for parent in parents],
+            'depth': depth,
+            'usage': usage,
+        }
+        self._commit_lineage('feature_node', node_id, payload, response)
+        return _json_copy(response)
+
+    def _replay_feature_node(self, node_id, request):
+        stored = self._lineage.nodes[node_id]
+        try:
+            candidate_parents = sorted(
+                (ident(parent['node_id']),
+                 _bounded_int(parent['offset'], 0, MAX_NODE_LENGTH - 1),
+                 _bounded_int(parent['width'], 1, MAX_NODE_LENGTH))
+                for parent in request['parents'])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('node id reused with different feature declaration')
+        stored_parents = sorted(
+            (parent['node_id'], parent['offset'], parent['width'])
+            for parent in stored['parents'])
+        try:
+            candidate_length = _bounded_int(request['length'], 1, MAX_NODE_LENGTH)
+        except (KeyError, TypeError, ValueError):
+            raise ValueError('node id reused with different feature declaration')
+        if candidate_length != stored['length'] or candidate_parents != stored_parents:
+            raise ValueError('node id reused with different feature declaration')
+        return _json_copy(self._responses[('feature_node', node_id)])
+
+    # ---------- 两类缺陷 ----------
+
+    def record_sample_defect(self, request):
+        """登记一条持续有效、可重叠的样本缺陷（不可撤销、不自动修复）。
+
+        副本缺陷::
+
+            d.record_sample_defect({
+                "request_id": "d-r0-108",
+                "scope": "receipt",
+                "target": "r0",
+                "interval": [108, 110],
+            })
+
+        物理采样缺陷（目标为台站）::
+
+            d.record_sample_defect({
+                "request_id": "d-A-108",
+                "scope": "physical",
+                "target": "A",
+                "interval": [108, 110],
+            })
+
+        ``scope=receipt`` 只让固定使用该回执的原始输入在相交位置失效；
+        ``scope=physical`` 影响该站所有实际使用这些采样的原始输入，与回执、
+        事件、校时版或发布请求无关。另一台站的相同刻度不受影响。
+        """
+        self._check_open()
+        fields(request, ('request_id', 'scope', 'target', 'interval'))
+        defect_id = ident(request['request_id'])
+        if defect_id in self._lineage.defect_ids:
+            stored = next(d for d in self._lineage.defects
+                          if d['request_id'] == defect_id)
+            candidate = {
+                'scope': request['scope'],
+                'target': ident(request['target']),
+                'interval': list(_ival(request['interval'])),
+            }
+            stored_key = {
+                'scope': stored['scope'],
+                'target': stored['target'],
+                'interval': list(stored['interval']),
+            }
+            if _canonical(candidate) == _canonical(stored_key):
+                return _json_copy(self._responses[('defect', defect_id)])
+            raise ValueError('defect request id reused with different content')
+        scope = request['scope']
+        if not isinstance(scope, str) or scope not in ('receipt', 'physical'):
+            raise ValueError("scope must be 'receipt' or 'physical'")
+        target = ident(request['target'])
+        lo, hi = _ival(request['interval'])
+        if scope == 'receipt':
+            if target not in self._receipts:
+                raise ValueError('unknown receipt_id')
+            rlo, rhi = self._receipts[target]['interval']
+            if not rlo <= lo < hi <= rhi:
+                raise ValueError('receipt defect interval must lie inside the receipt')
+        else:
+            if target not in self._domains:
+                raise ValueError('unknown station')
+            dlo, dhi = self._domains[target]
+            if not dlo <= lo < hi <= dhi:
+                raise ValueError('physical defect interval must lie inside the '
+                                 'station sampling domain')
+        payload = {
+            'request_id': defect_id,
+            'scope': scope,
+            'target': target,
+            'interval': [lo, hi],
+        }
+        response = {
+            'request_id': defect_id,
+            'accepted': True,
+            'scope': scope,
+            'target': target,
+            'interval': [lo, hi],
+        }
+        self._commit_lineage('defect', defect_id, payload, response)
+        return _json_copy(response)
+
+    def feature_health(self, node_id):
+        """返回节点完整输出域、规范无效并集及按缺陷请求 ID 分列的无效区间。
+
+        查询反映当前最新已登记缺陷；节点来源与依赖声明本身保持不变。
+        每组区间升序、无空段、不重叠，相邻同类影响合并；没有影响的缺陷
+        不列出。整个计算只做区间代数，不逐点展开输出。
+        """
+        self._check_open()
+        node_id = ident(node_id)
+        if node_id not in self._lineage.nodes:
+            raise UnknownNodeError(f'unknown feature node: {node_id}')
+        node = self._lineage.nodes[node_id]
+        overall, per_defect = self._lineage.health(node_id)
+        return {
+            'node_id': node_id,
+            'kind': node['kind'],
+            'output_domain': [0, node['length']],
+            'invalid_intervals': [[lo, hi] for lo, hi in overall],
+            'invalid_by_defect': {
+                defect_id: [[lo, hi] for lo, hi in intervals]
+                for defect_id, intervals in sorted(per_defect.items())},
+        }
+
+    # ---------- 交付凭证 ----------
+
+    def issue_feature_certificate(self, request):
+        """按当前血缘与缺陷审核并签发样本级交付凭证。
+
+        完整调用示例::
+
+            d.issue_feature_certificate({
+                "request_id": "cert-1",
+                "usage": "train",
+                "selections": [
+                    {"node_id": "G", "intervals": [[0, 4)]},
+                ],
+            })
+
+        ``usage`` 必须与每个被选节点继承的训练/盲测用途一致；节点不重复、
+        每节点区间集合非空且在输出域内。首次签发按当前缺陷检查全部所选
+        位置，任一位置无效则整笔拒绝，不产生任何凭证。成功后固定请求 ID、
+        用途、规范选择与不可变节点依赖/归档来源；历史凭证原文永不倒改，
+        其当前可用性用 :meth:`check_feature_certificate` 查询。
+        """
+        self._check_open()
+        fields(request, ('request_id', 'usage', 'selections'))
+        cert_id = ident(request['request_id'])
+        usage = _canonical_usage(request['usage'])
+        if usage not in ('train', 'blind'):
+            raise ValueError("usage must be 'train' or 'blind'")
+        existing = self._lineage.certificates.get(cert_id)
+        selections = self._normalize_selections(request['selections'], usage)
+        if existing is not None:
+            # 同 ID 等价重放返回首次凭证（即使它现在已不可用）；内容冲突拒绝。
+            if self._certificate_semantic(existing) != \
+                    self._selection_semantic(usage, selections):
+                raise ValueError('certificate request id reused with different content')
+            return _json_copy(self._certificate_view(existing))
+        # 首次签发：当前缺陷检查所有所选位置，一处坏即整笔拒绝。
+        for selection in selections:
+            overall, _ = self._lineage.health(selection['node_id'])
+            if any(lo < hi for lo, hi in
+                   (self._intersect([tuple(iv) for iv in selection['intervals']],
+                                    overall))):
+                raise ValueError('refuse certificate: selected positions contain '
+                                 'currently invalid samples')
+        node_ids = [selection['node_id'] for selection in selections]
+        raw_ids = self._lineage.raw_ancestors(node_ids)
+        lineage_refs = sorted(self._lineage.lineage_closure(node_ids))
+        certificate = {
+            'schema': FEATURE_CERTIFICATE_SCHEMA,
+            'request_id': cert_id,
+            'usage': usage,
+            'selections': [
+                {'node_id': selection['node_id'],
+                 'intervals': [list(iv) for iv in selection['intervals']]}
+                for selection in selections],
+            'node_ids': node_ids,
+            'lineage_node_ids': lineage_refs,
+            'raw_source_node_ids': raw_ids,
+        }
+        payload = {
+            'request_id': cert_id,
+            'usage': usage,
+            'selections': certificate['selections'],
+        }
+        self._commit_lineage('certificate', cert_id, payload, certificate)
+        return _json_copy(self._certificate_view(certificate))
+
+    def _normalize_selections(self, raw_selections, usage):
+        selections_in = array(raw_selections, 1, 10 ** 9)
+        seen_nodes = set()
+        selections = []
+        for raw in selections_in:
+            fields(raw, ('node_id', 'intervals'))
+            node_id = ident(raw['node_id'])
+            if node_id in seen_nodes:
+                raise ValueError('duplicate node in certificate selections')
+            seen_nodes.add(node_id)
+            if node_id not in self._lineage.nodes:
+                raise ValueError(f'unknown node: {node_id}')
+            node = self._lineage.nodes[node_id]
+            if node['usage'] != usage:
+                raise ValueError(
+                    f"certificate usage {usage} does not match node {node_id} "
+                    f"inherited usage {node['usage']}")
+            raw_intervals = array(raw['intervals'], 1, 10 ** 9)
+            intervals = []
+            for raw_iv in raw_intervals:
+                lo, hi = _ival(raw_iv)
+                if not 0 <= lo < hi <= node['length']:
+                    raise ValueError('selection interval outside node output domain')
+                intervals.append((lo, hi))
+            # 重排、重叠拆分、相邻拆分按同一个采样集合规范化。
+            intervals = _merge(intervals)
+            selections.append({'node_id': node_id, 'intervals': intervals})
+        selections.sort(key=lambda item: item['node_id'])
+        return selections
+
+    @staticmethod
+    def _intersect(left, right):
+        from .lineage import intersect_intervals
+        return intersect_intervals(left, right)
+
+    @staticmethod
+    def _selection_semantic(usage, selections):
+        return {
+            'usage': usage,
+            'selections': [
+                {'node_id': item['node_id'],
+                 'intervals': [[lo, hi] for lo, hi in item['intervals']]}
+                for item in selections],
+        }
+
+    def _certificate_semantic(self, certificate):
+        return {
+            'usage': certificate['usage'],
+            'selections': [
+                {'node_id': item['node_id'],
+                 'intervals': [list(iv) for iv in item['intervals']]}
+                for item in certificate['selections']],
+        }
+
+    def _certificate_view(self, certificate):
+        view = dict(certificate)
+        view['selections'] = [
+            {'node_id': item['node_id'],
+             'intervals': [list(iv) for iv in item['intervals']]}
+            for item in certificate['selections']]
+        return view
+
+    def read_feature_node(self, node_id):
+        """读取节点的原始登记声明；未知 ID 抛 UnknownNodeError。"""
+        self._check_open()
+        node_id = ident(node_id)
+        node = self._lineage.nodes.get(node_id)
+        if node is None:
+            raise UnknownNodeError(f'unknown feature node: {node_id}')
+        out = dict(node)
+        if node['kind'] == 'raw':
+            out['interval'] = list(node['interval'])
+            out['fragments'] = [dict(frag, interval=list(frag['interval']))
+                                for frag in node['fragments']]
+        else:
+            out['parents'] = [dict(parent) for parent in node['parents']]
+        return _json_copy(out)
+
+    def read_feature_certificate(self, request_id):
+        """读取首次成功签发时固定的凭证原文；不代表当前仍获准取用。"""
+        self._check_open()
+        cert_id = ident(request_id)
+        certificate = self._lineage.certificates.get(cert_id)
+        if certificate is None:
+            raise UnknownCertificateError(
+                f'no feature certificate for request id {cert_id}')
+        return _json_copy(self._certificate_view(certificate))
+
+    def check_feature_certificate(self, request_id):
+        """按当前缺陷判断历史凭证是否仍可使用（只读，不改写凭证原文）。
+
+        逐选择给出凭证真正选中位置内的当前无效区间及对应缺陷 ID；没有
+        缺陷命中的选择仍列出且其无效区间为空。历史凭证读取成功只说明它
+        曾成功签发，是否可当前取用以本返回的 ``currently_usable`` 为准。
+        """
+        self._check_open()
+        cert_id = ident(request_id)
+        certificate = self._lineage.certificates.get(cert_id)
+        if certificate is None:
+            raise UnknownCertificateError(
+                f'no feature certificate for request id {cert_id}')
+        selections_out = []
+        usable = True
+        for selection in certificate['selections']:
+            node_id = selection['node_id']
+            chosen = [tuple(iv) for iv in selection['intervals']]
+            _, per_defect = self._lineage.health(node_id)
+            defects_out = []
+            node_invalid = []
+            for defect_id, intervals in sorted(per_defect.items()):
+                hits = self._intersect(chosen, intervals)
+                if not hits:
+                    continue
+                defects_out.append({
+                    'defect_request_id': defect_id,
+                    'request_id': defect_id,
+                    'intervals': [[lo, hi] for lo, hi in hits],
+                })
+                node_invalid.extend(hits)
+            node_invalid = _merge(node_invalid)
+            if node_invalid:
+                usable = False
+            selections_out.append({
+                'node_id': node_id,
+                'selected_intervals': [list(iv) for iv in chosen],
+                'currently_invalid_intervals': [[lo, hi] for lo, hi in node_invalid],
+                'defects': defects_out,
+            })
+        return {
+            'request_id': cert_id,
+            'currently_usable': usable,
+            'usage': certificate['usage'],
+            'selections': selections_out,
+            'note': 'historical certificate text is immutable; this check reflects '
+                    'currently registered defects only',
+        }
+
+    def _commit_lineage(self, kind, request_id, payload, response):
+        """校验全部完成后再追加 journal；失败不留下任何部分状态。"""
+        existing = self._responses.get((kind, request_id))
+        if existing is not None:
+            raise ValueError(f'{kind} id already defined with different content')
+        self._append_journal(kind, request_id, payload, response)
+        # journal 已 COMMITTED：与 _apply_committed 相同的归一化应用到内存。
+        self._apply_committed({'kind': kind, 'id': request_id,
+                               'payload': payload, 'response': response})
+        self._flush_state()
 
 
 class ReleaseLedger:

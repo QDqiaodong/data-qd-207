@@ -23,6 +23,11 @@ from .event_catalog import (
     reconcile_event_catalog,
     solve_global_associations,
 )
+from .lineage import (
+    LineageError,
+    UnknownCertificateError,
+    UnknownNodeError,
+)
 
 __all__ = [
     'process',
@@ -41,6 +46,9 @@ __all__ = [
     'ReleaseRequestError',
     'ReleaseConflictError',
     'UnknownReleaseError',
+    'LineageError',
+    'UnknownNodeError',
+    'UnknownCertificateError',
     'reconcile_event_catalog',
     'solve_global_associations',
     'CatalogStateError',

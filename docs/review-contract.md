@@ -104,6 +104,17 @@
 API、预览字段、清单契约、幂等等价性和崩溃重开行为见
 [数据集发布账本契约](dataset-release.md)。
 
+## 样本级特征血缘与交付凭证（只登记依赖）
+
+在同一目录上还可使用 `capture_waveform_input`、`register_window_feature`、
+`record_sample_defect`、`feature_health`、`issue_feature_certificate`、
+`read_feature_node`、`read_feature_certificate` 与
+`check_feature_certificate`，把滑窗特征的实际归档来源、窗口依赖、副本/物理
+两类缺陷和受当前血缘约束的交付凭证固定下来。副本缺陷按片段接入
+`query_sources`、`request_offline` 与 `publish_release`，物理缺陷则在首次
+发布时整笔拒绝且不改变副本可读性分类。完整字段、传播公式、容量上限与
+重开语义见 [特征血缘与交付凭证契约](feature-lineage.md)。
+
 ## 明确不做的事
 
 不传输/解码/改写/删除波形数据，不做震源定位、震级或走时建模，不推断事件的
