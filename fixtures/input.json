@@ -1,0 +1,35 @@
+{
+  "stations": [
+    {
+      "id": "A",
+      "lat": "0",
+      "lon": "0"
+    },
+    {
+      "id": "B",
+      "lat": "1",
+      "lon": "1"
+    }
+  ],
+  "events": [
+    {
+      "id": "aP",
+      "station": "A",
+      "phase": "P",
+      "time": "10"
+    },
+    {
+      "id": "bP",
+      "station": "B",
+      "phase": "P",
+      "time": "10.4"
+    },
+    {
+      "id": "cS",
+      "station": "A",
+      "phase": "S",
+      "time": "20"
+    }
+  ],
+  "window": "0.5"
+}
