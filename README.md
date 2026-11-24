@@ -5,7 +5,7 @@
 登记中心归档回执并安全决定原始波形块下线；目录只登记数据引用，不传输、
 解码或删除波形文件。
 
-本仓主要交付是Python业务API和可供下游使用的结构化数据，不是通用CLI、报表或CRUD模板。字段、身份、单位、上限与失败边界见 [数据契约](docs/contract.md)；复核目录的输入、来源查询、幂等重放与崩溃重开语义见 [复核目录契约](docs/review-contract.md)。跨校时版本的稳定事件目录身份 `ceN`、全局继承选择与谱系 API 见 [事件目录身份契约](docs/event-catalog.md)。
+本仓主要交付是Python业务API和可供下游使用的结构化数据，不是通用CLI、报表或CRUD模板。字段、身份、单位、上限与失败边界见 [数据契约](docs/contract.md)；复核目录的输入、来源查询、幂等重放与崩溃重开语义见 [复核目录契约](docs/review-contract.md)。训练/盲测数据集发布账本、波形引用清单与重开幂等契约见 [数据集发布账本契约](docs/dataset-release.md)。跨校时版本的稳定事件目录身份 `ceN`、全局继承选择与谱系 API 见 [事件目录身份契约](docs/event-catalog.md)。
 
 ## 安装与验证
 
@@ -53,7 +53,16 @@ sources = d.query_sources()     # archive/online/missing 逐片段来源
 d.close()
 
 d2 = open_review("local/review")  # 另一位值班员重开，状态由提交日志重建
+
+# 训练/盲测发布账本：先预览不可拆组，再按发布请求 ID 原子发布已归档组。
+preview = d2.preview_release("v1", ["e1", "e2"], blind_event_ids=["e2"])
+group_key = preview["groups"][0]["group_key"]
+manifest = d2.publish_release(preview, [group_key], "release-1")
+saved = d2.read_release("release-1")  # 重开/重试均返回首次固定清单
 ```
+
+完整发布分组、历史用途冲突、归档缺口、清单引用和崩溃语义见
+[数据集发布账本契约](docs/dataset-release.md)。
 
 跨校时版本为事件分配稳定 `ceN` 身份并保留拆分/合并谱系（只读，不改目录）：
 
@@ -76,9 +85,10 @@ catalog = reconcile_event_catalog(catalog, d)     # 紧接处理下一校时版
 {"arrivals": 3, "events": 2, "multi_station": 1}
 ```
 
-现有 58 项测试全部通过（含 7 项旧入口回归、19 项复核目录验收/边界/崩溃重开
-用例，以及 32 项事件目录身份的规范键分配、全局选择、谱系、别名兼容、随机分区
-不变量与拒绝路径用例），并核对非法输入拒绝；样例数据全部原创合成，见 [来源](fixtures/SOURCES.md)。
+现有 66 项测试全部通过（含 7 项旧入口回归、复核目录验收/边界/崩溃重开
+用例、8 项数据集发布账本验收/API 兼容用例，以及事件目录身份的规范键分配、
+全局选择、谱系、别名兼容、随机分区不变量与拒绝路径用例），并核对非法输入拒绝；
+样例数据全部原创合成，见 [来源](fixtures/SOURCES.md)。
 
 ## 边界
 

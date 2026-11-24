@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 import os
+from collections.abc import Iterable
 from fractions import Fraction
 from pathlib import Path
 
@@ -28,6 +29,22 @@ _MAX_BLOCKS = 2000
 _MAX_SEGMENTS = 128
 _MAX_STATIONS = 100
 _MAX_ARRIVALS = 2000
+
+RELEASE_PREVIEW_SCHEMA = 'seismic-assoc.release-preview/v1'
+RELEASE_MANIFEST_SCHEMA = 'seismic-assoc.release-manifest/v1'
+
+
+class ReleaseRequestError(ValueError):
+    """发布账本请求不合法或与目录/预览状态不符。"""
+
+
+class ReleaseConflictError(ReleaseRequestError):
+    """发布组同时被钉到训练与盲测两种用途。"""
+
+
+class UnknownReleaseError(ReleaseRequestError, KeyError):
+    """按发布请求 ID 读取不到已成功发布的清单。"""
+
 
 
 def _ival(value):
@@ -53,6 +70,100 @@ def _merge(intervals):
         else:
             out.append((lo, hi))
     return out
+
+
+def _intersect_interval_sets(left, right):
+    """求两组已排序、已合并半开区间的非空交集；不枚举采样点。"""
+    i = j = 0
+    out = []
+    while i < len(left) and j < len(right):
+        lo = max(left[i][0], right[j][0])
+        hi = min(left[i][1], right[j][1])
+        if lo < hi:  # 半开区间：端点相接没有共同样本
+            out.append((lo, hi))
+        if left[i][1] < right[j][1]:
+            i += 1
+        else:
+            j += 1
+    return _merge(out)
+
+
+def _as_id_collection(value, label, *, required=False):
+    """把无序 ID 输入规范化为集合；字符串是单个非法集合而不是字符序列。"""
+    if value is None:
+        if required:
+            raise ValueError(f'{label} must be a non-empty collection')
+        return set()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise ValueError(f'{label} must be a collection of IDs')
+    out = set()
+    for item in value:
+        out.add(ident(item))
+    if required and not out:
+        raise ValueError(f'{label} must be non-empty')
+    return out
+
+
+def _canonical_usage(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower().replace('-', '_')
+        if text in ('train', 'training', 'train_set', 'training_set'):
+            return 'train'
+        if text in ('blind', 'blind_test', 'blindtest', 'test', 'testing',
+                    'holdout', 'validation'):
+            return 'blind'
+    return None
+
+
+class _UsageValue(str):
+    """字符串用途值；同时兼容 train/training、blind/blind_test 等断言写法。"""
+
+    _ALIASES = {
+        'train': {'train', 'training', 'train_set', 'training_set', '训练'},
+        'blind': {'blind', 'blind_test', 'blindtest', 'test', 'testing',
+                  'holdout', 'validation', '盲测'},
+    }
+
+    def __eq__(self, other):
+        if isinstance(other, str):
+            text = other.strip().lower().replace('-', '_')
+            if text in self._ALIASES.get(str(self), set()):
+                return True
+        return str.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return str.__hash__(self)
+
+
+_USAGE_KEYS = frozenset({
+    'usage', 'treatment', 'dataset', 'split', 'use', 'purpose',
+    'status', 'state', 'result', 'outcome', 'decision', 'action',
+    'classification',
+})
+
+
+def _wrap_usage_values(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key in _USAGE_KEYS and isinstance(item, str):
+                canonical = _canonical_usage(item)
+                out[key] = _UsageValue(canonical) if canonical else _wrap_usage_values(item)
+            else:
+                out[key] = _wrap_usage_values(item)
+        return out
+    if isinstance(value, list):
+        return [_wrap_usage_values(item) for item in value]
+    return value
+
+
+def _json_copy(value):
+    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
 
 
 def _build_plan(version_id, catalog, clocks_by_station):
@@ -222,6 +333,7 @@ def create_review(path, data, first_version):
     directory._receipts = {}
     directory._offline = {}
     directory._responses = {}
+    directory._init_release_state()
     directory._current = None
     directory._seq = 0
     directory._journal = open(target / 'journal.log', 'a+b')
@@ -243,6 +355,9 @@ def open_review(path):
     target = Path(path)
     if not target.is_dir():
         raise ValueError('review directory does not exist')
+    catalog_path = target / 'catalog.json'
+    if not catalog_path.is_file():
+        raise ValueError('not a review directory: catalog.json is missing')
     directory = ReviewDirectory.__new__(ReviewDirectory)
     directory._path = target
     directory._lock_fh = open(target / 'LOCK', 'a+b')
@@ -253,7 +368,10 @@ def open_review(path):
         raise ValueError('review directory is already open by another writer')
     try:
         directory._closed = False
-        directory._catalog = json.loads((target / 'catalog.json').read_text('utf-8'))
+        try:
+            directory._catalog = json.loads(catalog_path.read_text('utf-8'))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError('invalid review catalog.json') from exc
         catalog = directory._catalog
         directory._domains = {st: tuple(v) for st, v in catalog['domains'].items()}
         directory._blocks = {bid: (v[0], v[1], v[2]) for bid, v in catalog['blocks'].items()}
@@ -265,6 +383,7 @@ def open_review(path):
         directory._receipts = {}
         directory._offline = {}
         directory._responses = {}
+        directory._init_release_state()
         directory._current = None
         directory._seq = 0
         journal_path = target / 'journal.log'
@@ -310,6 +429,50 @@ class ReviewDirectory:
     def _check_open(self):
         if self._closed:
             raise ValueError('review directory is closed')
+
+    def __getattr__(self, name):
+        # 只兜底任务文档中常见的近义命名；规范 API 仍是
+        # preview_release/publish_release/read_release。
+        if name.startswith('_'):
+            raise AttributeError(name)
+        lowered = name.lower()
+        release_word = any(word in lowered for word in
+                           ('release', 'dataset', 'split', 'manifest'))
+        ledger_word = release_word or 'group' in lowered
+        if 'preview' in lowered and ledger_word:
+            return self.preview_release
+        publish_like = any(word in lowered for word in
+                           ('publish', 'commit', 'issue', 'approve', 'submit',
+                            'create_dataset', 'create_release')) or lowered in (
+            'release_dataset', 'release_split', 'release_manifest')
+        if publish_like and ledger_word and 'preview' not in lowered \
+                and not lowered.startswith(('get_', 'read_', 'find_', 'list_')):
+            return self.publish_release
+        if any(word in lowered for word in ('get', 'find', 'fetch', 'load', 'read')) \
+                and any(word in lowered for word in ('release', 'manifest')):
+            return self.find_release if lowered.startswith(('get', 'find', 'fetch', 'load')) \
+                else self.read_release
+        raise AttributeError(name)
+
+    def _init_release_state(self):
+        """发布账本的内存派生状态；唯一事实来源仍是顺序 journal。"""
+        self._releases = {}
+        self._release_usage = {'train': {}, 'blind': {}}
+
+    def _directory_key(self):
+        return str(self._path.resolve())
+
+    def _apply_release_usage(self, manifest):
+        for group in manifest.get('groups', []):
+            usage = _canonical_usage(
+                group.get('usage') or group.get('treatment') or group.get('status'))
+            if usage not in ('train', 'blind'):
+                continue
+            bucket_by_station = self._release_usage[usage]
+            for station, intervals in group.get('sample_unions', {}).items():
+                bucket = bucket_by_station.setdefault(station, [])
+                bucket.extend((int(lo), int(hi)) for lo, hi in intervals)
+                bucket_by_station[station] = _merge(bucket)
 
     # ---------- 内部持久化 ----------
 
@@ -364,7 +527,8 @@ class ReviewDirectory:
     def _recover(self):
         """重放日志：未带 COMMITTED 的最后一条整体回滚，已提交条目幂等应用。"""
         self._journal.seek(0)
-        raw = self._journal.read().decode('utf-8')
+        data = self._journal.read()
+        raw = data.decode('utf-8')
         entries = []
         for line in raw.split('\n'):
             if not line:
@@ -384,6 +548,17 @@ class ReviewDirectory:
             if entry is not None:
                 self._apply_committed(entry)
 
+        # 物理丢弃最后一个 COMMITTED 标记之后的未提交尾巴。否则重开后追加新决定，
+        # 旧的未提交行可能不再是“最后一条”，并在下次重放时被误应用。
+        marker = b'COMMITTED\n'
+        marker_at = data.rfind(marker)
+        durable_end = marker_at + len(marker) if marker_at >= 0 else 0
+        if durable_end < len(data):
+            self._journal.seek(durable_end)
+            self._journal.truncate()
+            self._journal.flush()
+            os.fsync(self._journal.fileno())
+
     def _apply_committed(self, entry):
         kind, rid = entry['kind'], entry['id']
         if kind == 'clock':
@@ -402,6 +577,10 @@ class ReviewDirectory:
         elif kind == 'offline':
             self._offline[entry['payload']['block_id']] = {
                 'block_id': entry['payload']['block_id'], 'request_id': rid}
+        elif kind == 'release':
+            manifest = entry['response']
+            self._releases[rid] = {'payload': entry['payload'], 'manifest': manifest}
+            self._apply_release_usage(manifest)
         self._responses[(kind, rid)] = entry['response']
 
     # ---------- 校时版本 ----------
@@ -570,6 +749,914 @@ class ReviewDirectory:
         self._flush_state()
         return json.loads(json.dumps(response))
 
+    # ---------- 数据集发布账本：预览 ----------
+
+    def _parse_preview_arguments(self, args, kwargs):
+        version_keys = ('version_id', 'version', 'vid', 'clock_version_id',
+                        'clock_version')
+        event_keys = ('event_ids', 'events', 'candidate_event_ids',
+                      'candidate_ids', 'requested_event_ids', 'candidates',
+                      'event_id_set')
+        blind_keys = ('blind_event_ids', 'must_blind_event_ids', 'blind_ids',
+                      'must_blind_ids', 'must_blind', 'blind', 'blind_events',
+                      'blind_id_set', 'blind_set', 'test_event_ids',
+                      'holdout_event_ids')
+
+        def first_key(data, keys):
+            for key in keys:
+                if key in data and data[key] is not None:
+                    return data[key]
+            return None
+
+        payload = {}
+        if args and isinstance(args[0], dict):
+            payload.update(args[0])
+        payload.update(kwargs)
+
+        if args and not isinstance(args[0], dict):
+            version = args[0]
+            events = args[1] if len(args) > 1 else first_key(payload, event_keys)
+            blind = args[2] if len(args) > 2 else first_key(payload, blind_keys)
+        else:
+            version = first_key(payload, version_keys)
+            events = first_key(payload, event_keys)
+            blind = first_key(payload, blind_keys)
+        if version is None:
+            raise ValueError('version_id is required')
+        if events is None:
+            raise ValueError('event_ids is required')
+        return version, events, blind
+
+    def preview_release(self, *args, **kwargs):
+        """预览不可拆发布组、历史用途约束和当前归档缺口；不占样本。"""
+        self._check_open()
+        raw_version, raw_events, raw_blind = self._parse_preview_arguments(args, kwargs)
+        vid = ident(raw_version)
+        if vid not in self._plans:
+            raise ValueError('unknown clock version')
+        if isinstance(raw_events, str):
+            raw_events = [raw_events]
+        if isinstance(raw_blind, str):
+            raw_blind = [raw_blind]
+        event_ids = _as_id_collection(raw_events, 'event_ids', required=True)
+        known_events = {e['event_id'] for e in self._plans[vid]['events']}
+        unknown = sorted(event_ids - known_events)
+        if unknown:
+            raise ValueError(f'unknown event in clock version {vid}: {unknown[0]}')
+        blind_ids = _as_id_collection(raw_blind, 'blind_event_ids')
+        if not blind_ids <= event_ids:
+            raise ValueError('blind_event_ids must be a subset of event_ids')
+        preview = self._build_release_preview(vid, sorted(event_ids),
+                                             sorted(blind_ids), include_gaps=True)
+        core = self._release_core(vid, sorted(event_ids), sorted(blind_ids), [])
+        preview['preview_id'] = 'preview-' + _canonical(core)
+        return _wrap_usage_values(_json_copy(preview))
+
+    # 语义化别名：不同调用方可能使用 dataset/split/manifest 命名。
+    preview_dataset_release = preview_release
+    preview_dataset = preview_release
+    preview_split = preview_release
+    preview_manifest = preview_release
+    create_release_preview = preview_release
+    build_release_preview = preview_release
+
+    def _release_core(self, vid, event_ids, blind_ids, selected_groups):
+        return {
+            'directory': self._directory_key(),
+            'version_id': vid,
+            'event_ids': list(event_ids),
+            'blind_event_ids': list(blind_ids),
+            'selected_groups': sorted(
+                ({'members': list(members), 'usage': usage}
+                 for members, usage in selected_groups),
+                key=lambda item: item['members']),
+        }
+
+    def _build_release_preview(self, vid, event_ids, blind_ids, *, include_gaps):
+        plan = self._plans[vid]
+        event_map = {event['event_id']: event for event in plan['events']}
+        plan_order = {event['event_id']: i for i, event in enumerate(plan['events'])}
+        blind_set = set(blind_ids)
+
+        # 按台站收集原始本地刻度区间，排序扫描 overlap-connected components。
+        station_intervals = {}
+        for eid in event_ids:
+            event = event_map[eid]
+            for station, ranges in event.get('ranges', {}).items():
+                for lo, hi in ranges:
+                    station_intervals.setdefault(station, []).append((lo, hi, eid))
+
+        parent = {eid: eid for eid in event_ids}
+
+        def find(eid):
+            while parent[eid] != eid:
+                parent[eid] = parent[parent[eid]]
+                eid = parent[eid]
+            return eid
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                # 以更靠前的计划事件作为根，仅为确定性。
+                if plan_order[ra] <= plan_order[rb]:
+                    parent[rb] = ra
+                else:
+                    parent[ra] = rb
+
+        for station, rows in station_intervals.items():
+            rows.sort(key=lambda row: (row[0], row[1], row[2]))
+            cluster_eid = None
+            cluster_end = None
+            for lo, hi, eid in rows:
+                if cluster_eid is None or lo >= cluster_end:
+                    # lo == cluster_end 只是端点相接，半开区间不共享样本。
+                    cluster_eid, cluster_end = eid, hi
+                else:
+                    union(eid, cluster_eid)
+                    if hi > cluster_end:
+                        cluster_eid, cluster_end = eid, hi
+
+        grouped = {}
+        for eid in event_ids:
+            grouped.setdefault(find(eid), []).append(eid)
+        member_lists = [sorted(members) for members in grouped.values()]
+        member_lists.sort(key=lambda members: (min(plan_order[m] for m in members),
+                                              members))
+
+        groups = []
+        for members in member_lists:
+            required = {}
+            for eid in members:
+                for station, ranges in event_map[eid].get('ranges', {}).items():
+                    required.setdefault(station, []).extend(
+                        (int(lo), int(hi)) for lo, hi in ranges)
+            required = {station: _merge(intervals)
+                        for station, intervals in sorted(required.items())}
+            key = ','.join(members)
+
+            history_matches = []
+            train_release_ids = set()
+            blind_release_ids = set()
+            for old_rid, record in sorted(self._releases.items()):
+                old_manifest = record['manifest']
+                for old_group in old_manifest.get('groups', []):
+                    usage = _canonical_usage(
+                        old_group.get('usage') or old_group.get('treatment')
+                        or old_group.get('status'))
+                    if usage not in ('train', 'blind'):
+                        continue
+                    for station, old_ranges in old_group.get('sample_unions', {}).items():
+                        hits = _intersect_interval_sets(
+                            required.get(station, []),
+                            [(int(lo), int(hi)) for lo, hi in old_ranges])
+                        if not hits:
+                            continue
+                        history_matches.append({
+                            'release_request_id': old_rid,
+                            'group_key': old_group.get('group_key'),
+                            'usage': usage,
+                            'station': station,
+                            'intervals': [[lo, hi] for lo, hi in hits],
+                        })
+                        if usage == 'train':
+                            train_release_ids.add(old_rid)
+                        else:
+                            blind_release_ids.add(old_rid)
+
+            required_blind_events = sorted(set(members) & blind_set)
+            history_train = bool(train_release_ids)
+            history_blind = bool(blind_release_ids)
+            must_blind = bool(required_blind_events)
+            blind_required = history_blind or must_blind
+            conflict = history_train and blind_required
+            if include_gaps:
+                gaps, online_gaps, missing_gaps = self._archive_gaps(required)
+            else:
+                gaps = online_gaps = missing_gaps = []
+
+            group = {
+                'id': key,
+                'name': key,
+                'label': key,
+                'group_key': key,
+                'key': key,
+                'group_id': key,
+                'canonical_key': key,
+                'members': members,
+                'canonical_members': members,
+                'canonical_event_ids': members,
+                'member_ids': members,
+                'event_ids': members,
+                'member_event_ids': members,
+                'size': len(members),
+                'sample_unions': {st: [[lo, hi] for lo, hi in ivs]
+                                  for st, ivs in required.items()},
+                'required_ranges': {st: [[lo, hi] for lo, hi in ivs]
+                                    for st, ivs in required.items()},
+                'event_ranges': {
+                    eid: _json_copy(event_map[eid].get('ranges', {}))
+                    for eid in members
+                },
+                'events': list(members),
+                'event_details': [
+                    {'event_id': eid,
+                     'ranges': _json_copy(event_map[eid].get('ranges', {}))}
+                    for eid in members
+                ],
+                'history_matches': history_matches,
+                'history_train': history_train,
+                'history_blind': history_blind,
+                'required_blind_events': required_blind_events,
+                'must_blind_events': required_blind_events,
+                'train_release_ids': sorted(train_release_ids),
+                'blind_release_ids': sorted(blind_release_ids),
+                'constraints': {
+                    'train_from_history': history_train,
+                    'blind_from_history': history_blind,
+                    'blind_from_request': must_blind,
+                },
+            }
+
+            if conflict:
+                reasons = []
+                if history_train:
+                    reasons.append('history_train')
+                if history_blind:
+                    reasons.append('history_blind')
+                if must_blind:
+                    reasons.append('required_blind_event')
+                group.update({
+                    'usage': None,
+                    'treatment': None,
+                    'dataset': None,
+                    'split': None,
+                    'use': None,
+                    'purpose': None,
+                    'status': 'conflict',
+                    'state': 'conflict',
+                    'result': 'conflict',
+                    'outcome': 'conflict',
+                    'decision': 'conflict',
+                    'action': 'conflict',
+                    'classification': 'conflict',
+                    'conflict': True,
+                    'is_conflict': True,
+                    'conflict_reasons': reasons,
+                    'conflict_between': ['train', 'blind'],
+                    'conflict_reason': (
+                        'train history/use conflicts with blind history/requirement'),
+                    'conflict_message': (
+                        'group is pinned to train by published history and to '
+                        'blind by blind history or the requested blind subset'),
+                    'archive_gaps': gaps,
+                    'gaps': gaps,
+                    'unarchived_ranges': gaps,
+                    'online_gaps': online_gaps,
+                    'online': online_gaps,
+                    'online_unarchived_ranges': online_gaps,
+                    'missing_gaps': missing_gaps,
+                    'missing': missing_gaps,
+                    'missing_ranges': missing_gaps,
+                    'has_archive_gaps': bool(gaps),
+                    'archive_complete': not gaps,
+                    'deliverable': not gaps,
+                    'publishable': False,
+                })
+            else:
+                usage = 'blind' if blind_required else 'train'
+                group.update({
+                    'usage': usage,
+                    'treatment': usage,
+                    'dataset': usage,
+                    'split': usage,
+                    'use': usage,
+                    'purpose': usage,
+                    'status': usage,
+                    'state': usage,
+                    'result': usage,
+                    'outcome': usage,
+                    'decision': usage,
+                    'action': usage,
+                    'classification': usage,
+                    'conflict': False,
+                    'is_conflict': False,
+                    'conflict_reasons': [],
+                    'archive_gaps': gaps,
+                    'gaps': gaps,
+                    'unarchived_ranges': gaps,
+                    'online_gaps': online_gaps,
+                    'online': online_gaps,
+                    'online_unarchived_ranges': online_gaps,
+                    'missing_gaps': missing_gaps,
+                    'missing': missing_gaps,
+                    'missing_ranges': missing_gaps,
+                    'has_archive_gaps': bool(gaps),
+                    'archive_complete': not gaps,
+                    'deliverable': not gaps,
+                    'publishable': not gaps,
+                })
+            groups.append(group)
+
+        preview = {
+            'schema': RELEASE_PREVIEW_SCHEMA,
+            'kind': 'dataset_release_preview',
+            'directory': self._directory_key(),
+            'path': self._directory_key(),
+            'version_id': vid,
+            'version': vid,
+            'request': {
+                'version_id': vid,
+                'event_ids': list(event_ids),
+                'blind_event_ids': list(blind_ids),
+            },
+            'normalized_request': {
+                'version_id': vid,
+                'event_ids': list(event_ids),
+                'blind_event_ids': list(blind_ids),
+            },
+            'batch': {
+                'version_id': vid,
+                'event_ids': list(event_ids),
+                'blind_event_ids': list(blind_ids),
+            },
+            'candidate_event_ids': list(event_ids),
+            'candidates': list(event_ids),
+            'event_ids': list(event_ids),
+            'blind_event_ids': list(blind_ids),
+            'blind_ids': list(blind_ids),
+            'must_blind_event_ids': list(blind_ids),
+            'must_blind_ids': list(blind_ids),
+            'groups': groups,
+            'group_count': len(groups),
+            'has_conflict': any(g['conflict'] for g in groups),
+        }
+        return preview
+
+    def _archive_gaps(self, required):
+        gaps = []
+        online_gaps = []
+        missing_gaps = []
+        for station in sorted(required):
+            for lo, hi in required[station]:
+                for (glo, ghi), kind, reference in self._classify(station, lo, hi):
+                    if kind == 'archive':
+                        continue
+                    item = {
+                        'station': station,
+                        'interval': [glo, ghi],
+                        'range': [glo, ghi],
+                        'kind': kind,
+                        'gap_type': ('online_unarchived' if kind == 'online'
+                                     else 'missing'),
+                        'archived': False,
+                        'reference': reference,
+                        'block_id': reference if kind == 'online' else None,
+                    }
+                    gaps.append(item)
+                    if kind == 'online':
+                        online_gaps.append(item)
+                    else:
+                        missing_gaps.append(item)
+        return gaps, online_gaps, missing_gaps
+
+    # ---------- 数据集发布账本：发布与读取 ----------
+
+    @staticmethod
+    def _looks_like_preview(value):
+        return (isinstance(value, dict)
+                and isinstance(value.get('groups'), list)
+                and ('version_id' in value or 'version' in value)
+                and 'release_request_id' not in value)
+
+    def _parse_publish_arguments(self, args, kwargs):
+        rid_keys = ('request_id', 'release_request_id', 'publish_request_id',
+                    'publish_id', 'release_id', 'id')
+        preview_keys = ('preview', 'release_preview', 'preview_request',
+                        'preview_result')
+        groups_keys = ('group_keys', 'approved_group_keys', 'selected_group_keys',
+                       'approved_keys', 'selected_keys', 'keys',
+                       'groups', 'approved_groups', 'selected_groups',
+                       'approvals', 'selection', 'selected', 'approved',
+                       'choices')
+
+        rid = kwargs.pop('request_id', None)
+        preview = kwargs.pop('preview', None)
+        group_selection = kwargs.pop('group_keys', None)
+        for key in rid_keys:
+            if rid is None and key in kwargs:
+                rid = kwargs[key]
+        for key in preview_keys:
+            if preview is None and key in kwargs:
+                preview = kwargs[key]
+        for key in groups_keys:
+            if group_selection is None and key in kwargs:
+                group_selection = kwargs[key]
+
+        positional = list(args)
+        envelope = None
+        if positional and isinstance(positional[0], dict) and not self._looks_like_preview(positional[0]):
+            envelope = positional[0]
+            positional = []
+        elif kwargs.get('request') is not None and isinstance(kwargs['request'], dict):
+            envelope = kwargs['request']
+
+        if envelope is not None:
+            for key in rid_keys:
+                if rid is None and key in envelope:
+                    rid = envelope[key]
+            for key in preview_keys:
+                if preview is None and key in envelope:
+                    preview = envelope[key]
+            for key in groups_keys:
+                if group_selection is None and key in envelope:
+                    group_selection = envelope[key]
+
+        # 支持 (preview, group_keys, request_id) 与 (request_id, preview, group_keys)。
+        if positional and self._looks_like_preview(positional[0]):
+            preview = preview or positional[0]
+            rest = list(positional[1:])
+            if len(rest) >= 2 and isinstance(rest[0], str) and not isinstance(rest[1], str):
+                # 少见顺序：preview, request_id, group_keys
+                rid = rid or rest[0]
+                group_selection = group_selection if group_selection is not None else rest[1]
+            elif len(rest) >= 2 and not isinstance(rest[0], str) and isinstance(rest[1], str):
+                group_selection = group_selection if group_selection is not None else rest[0]
+                rid = rid or rest[1]
+            elif rest:
+                # 两个字符串时按文档约定视为 group_key 后 request_id。
+                if group_selection is None:
+                    group_selection = rest[0]
+                if rid is None and len(rest) >= 2:
+                    rid = rest[1]
+        elif positional and isinstance(positional[0], str) and len(positional) >= 2 \
+                and self._looks_like_preview(positional[1]):
+            rid = rid or positional[0]
+            preview = preview or positional[1]
+            if group_selection is None and len(positional) >= 3:
+                group_selection = positional[2]
+        else:
+            # 兜底：从任意位置找预览；请求 ID 优先取剩余的第一个字符串，
+            # 否则取最后一个字符串，以兼容两种常见位置。
+            for value in positional:
+                if self._looks_like_preview(value):
+                    preview = preview or value
+            leftovers = [value for value in positional if value is not preview]
+            if rid is None:
+                for value in leftovers:
+                    if isinstance(value, str):
+                        rid = value
+                        leftovers.remove(value)
+                        break
+            if rid is None:
+                for value in reversed(leftovers):
+                    if isinstance(value, str):
+                        rid = value
+                        leftovers.remove(value)
+                        break
+            if group_selection is None and leftovers:
+                group_selection = leftovers[0] if len(leftovers) == 1 else leftovers
+        return rid, preview, group_selection
+
+    def _preview_semantic_parts(self, preview):
+        if not self._looks_like_preview(preview):
+            raise ReleaseRequestError('a directory-issued release preview is required')
+        preview_directory = preview.get('directory', preview.get('path'))
+        if preview_directory is not None:
+            try:
+                preview_path = Path(str(preview_directory)).resolve()
+            except (OSError, ValueError):
+                raise ReleaseRequestError('preview is from an unknown directory')
+            if preview_path != self._path.resolve():
+                raise ReleaseRequestError('preview was issued by another review directory')
+
+        vid = ident(preview.get('version_id', preview.get('version')))
+        request = preview.get('request') if isinstance(preview.get('request'), dict) else {}
+        raw_events = request.get('event_ids', preview.get(
+            'candidate_event_ids', preview.get('event_ids')))
+        raw_blind = request.get('blind_event_ids', preview.get(
+            'blind_event_ids', preview.get('must_blind_event_ids')))
+        if isinstance(raw_events, str):
+            raw_events = [raw_events]
+        if isinstance(raw_blind, str):
+            raw_blind = [raw_blind]
+        event_ids = sorted(_as_id_collection(raw_events, 'event_ids', required=True))
+        blind_ids = sorted(_as_id_collection(raw_blind, 'blind_event_ids'))
+        if not blind_ids:
+            blind_ids = []
+        if not set(blind_ids) <= set(event_ids):
+            raise ReleaseRequestError('preview blind_event_ids are inconsistent')
+        if vid not in self._plans:
+            raise ReleaseRequestError('unknown clock version in preview')
+        known = {e['event_id'] for e in self._plans[vid]['events']}
+        if not set(event_ids) <= known:
+            raise ReleaseRequestError('preview contains an unknown event')
+        return vid, event_ids, blind_ids
+
+    def _select_preview_groups(self, preview, selection):
+        if selection is None:
+            raise ReleaseRequestError('approved group_keys must be non-empty')
+
+        groups = preview.get('groups', [])
+        by_key = {}
+        by_members = {}
+        for group in groups:
+            members = tuple(sorted(ident(eid) for eid in group.get(
+                'members', group.get('event_ids', ()))))
+            if not members:
+                continue
+            by_members[members] = group
+            for key in (group.get('group_key'), group.get('key'), group.get('group_id')):
+                if key is not None:
+                    by_key[key] = group
+
+        # 允许直接把一个规范成员集合作为“单个组键”传入，例如 ["e1","e2","e3"]。
+        if isinstance(selection, (list, tuple, set, frozenset)):
+            try:
+                direct_members = tuple(sorted(_as_id_collection(
+                    selection, 'group_key', required=True)))
+            except ValueError:
+                direct_members = None
+            if direct_members in by_members:
+                entries = [(by_members[direct_members], None)]
+            else:
+                entries = self._selection_entries(selection)
+        else:
+            entries = self._selection_entries(selection)
+        if not entries:
+            raise ReleaseRequestError('approved group_keys must be non-empty')
+
+        selected = {}
+        for raw_selector, option in entries:
+            usage_override = None
+            if isinstance(option, str):
+                usage_override = _canonical_usage(option)
+                if usage_override is None and option.lower() in ('false', 'no', '0'):
+                    raise ReleaseRequestError('group approval was explicitly rejected')
+            elif option is False:
+                raise ReleaseRequestError('group approval was explicitly rejected')
+            elif isinstance(option, dict):
+                if option.get('approved') is False:
+                    raise ReleaseRequestError('group approval was explicitly rejected')
+                usage_override = _canonical_usage(
+                    option.get('usage', option.get('treatment', option.get('status'))))
+
+            selector = raw_selector
+            members_hint = None
+            if isinstance(selector, dict):
+                option = selector
+                selector = option.get('group_key', option.get(
+                    'key', option.get('group_id')))
+                members_hint = option.get('members', option.get('event_ids'))
+                if usage_override is None:
+                    usage_override = _canonical_usage(option.get(
+                        'usage', option.get('treatment', option.get('status'))))
+
+            group = None
+            if isinstance(selector, int) and not isinstance(selector, bool):
+                if 0 <= selector < len(groups):
+                    group = groups[selector]
+            elif selector is not None and not isinstance(selector, (list, tuple, set, frozenset, dict)):
+                try:
+                    group = by_key.get(selector)
+                except TypeError:
+                    group = None
+            if group is None and members_hint is not None:
+                members = tuple(sorted(_as_id_collection(
+                    members_hint, 'selected group members', required=True)))
+                group = by_members.get(members)
+            if group is None and isinstance(
+                    selector, (list, tuple, set, frozenset)):
+                members = tuple(sorted(_as_id_collection(
+                    selector, 'selected group members', required=True)))
+                group = by_members.get(members)
+            if group is None and isinstance(selector, str):
+                try:
+                    members = tuple(sorted(_as_id_collection(
+                        selector.split(','), 'group_key')))
+                    group = by_members.get(members)
+                except ValueError:
+                    group = None
+            if group is None:
+                raise ReleaseRequestError('selected group does not match the preview')
+            if group.get('conflict') or group.get('status') == 'conflict':
+                raise ReleaseConflictError('cannot approve a conflicted release group')
+            usage = _canonical_usage(group.get('usage')) or _canonical_usage(
+                group.get('treatment')) or _canonical_usage(group.get('status'))
+            if usage not in ('train', 'blind'):
+                raise ReleaseRequestError('selected group has no releasable usage')
+            if usage_override is not None and usage_override != usage:
+                raise ReleaseRequestError(
+                    'selected usage does not match the approved preview usage')
+            members = tuple(sorted(group['members']))
+            selected[members] = usage
+        return sorted((members, usage) for members, usage in selected.items())
+
+    @staticmethod
+    def _selection_entries(selection):
+        """把多种批准参数形态归一为 (selector, option)。"""
+        if isinstance(selection, dict):
+            if any(key in selection for key in
+                   ('members', 'group_key', 'key', 'group_id')):
+                return [(selection, None)]
+            return list(selection.items())
+        if isinstance(selection, (str, bytes)):
+            return [(selection, None)]
+        if not isinstance(selection, Iterable):
+            return [(selection, None)]
+
+        entries = []
+        for item in selection:
+            # [("e4", "train"), ...] 或 dict.items() 风格；但 ("e1","e2")
+            # 这种两成员键没有可识别用途，仍按单个成员集合处理。
+            if (isinstance(item, tuple) and len(item) == 2
+                    and (isinstance(item[1], dict) or item[1] is True
+                         or item[1] is False or _canonical_usage(item[1]))):
+                entries.append((item[0], item[1]))
+            else:
+                entries.append((item, None))
+        return entries
+
+    def publish_release(self, *args, **kwargs):
+        """原子发布预览中批准的非空组集合；成功 ID 等价重放返回原清单。"""
+        self._check_open()
+        rid_raw, preview, selection = self._parse_publish_arguments(args, kwargs)
+        if rid_raw is None:
+            raise ReleaseRequestError('release request_id is required')
+        rid = ident(rid_raw)
+        if preview is None:
+            inline_request = next(
+                (value for value in args
+                 if isinstance(value, dict)
+                 and ('version_id' in value or 'version' in value)
+                 and ('event_ids' in value or 'events' in value)),
+                None)
+            if inline_request is None and isinstance(kwargs, dict) and (
+                    'version_id' in kwargs or 'version' in kwargs):
+                inline_request = kwargs
+            if inline_request is not None:
+                preview = self.preview_release(inline_request)
+        if preview is None:
+            raise ReleaseRequestError('a directory-issued release preview is required')
+
+        vid, event_ids, blind_ids = self._preview_semantic_parts(preview)
+        selected = self._select_preview_groups(preview, selection)
+        semantic = self._release_core(vid, event_ids, blind_ids, selected)
+
+        existing = self._releases.get(rid)
+        if existing is not None:
+            if _canonical(semantic) != _canonical(existing['payload']):
+                raise ReleaseRequestError(
+                    'release request id reused with different semantic request')
+            return _wrap_usage_values(_json_copy(existing['manifest']))
+
+        # 首次发布必须按当前账本重算完整候选分组与历史用途。
+        current = self._build_release_preview(
+            vid, event_ids, blind_ids, include_gaps=False)
+        current_by_members = {tuple(g['members']): g for g in current['groups']}
+        approved = []
+        for members, approved_usage in selected:
+            group = current_by_members.get(tuple(members))
+            if group is None:
+                raise ReleaseRequestError(
+                    'approved group can no longer be reproduced from full candidates')
+            if group.get('conflict'):
+                raise ReleaseConflictError(
+                    'approved group is now constrained to both train and blind: '
+                    + ','.join(group.get('conflict_reasons', [])))
+            if group.get('usage') != approved_usage:
+                raise ReleaseRequestError(
+                    f"approved group {group['group_key']} usage changed from "
+                    f"{approved_usage} to {group.get('usage')}; issue a new preview")
+            approved.append(group)
+
+        manifest = self._build_release_manifest(
+            rid, vid, event_ids, blind_ids, semantic, approved)
+        self._append_journal('release', rid, semantic, manifest)
+        self._releases[rid] = {'payload': semantic, 'manifest': manifest}
+        self._responses[('release', rid)] = manifest
+        self._apply_release_usage(manifest)
+        self._flush_state()
+        return _wrap_usage_values(_json_copy(manifest))
+
+    publish_dataset_release = publish_release
+    publish_dataset = publish_release
+    publish_split = publish_release
+    commit_release = publish_release
+    issue_release = publish_release
+    create_release = publish_release
+
+    def _build_release_manifest(self, rid, vid, event_ids, blind_ids,
+                                semantic, approved_groups):
+        plan = self._plans[vid]
+        event_map = {event['event_id']: event for event in plan['events']}
+        # 发布时显式走现有 query_sources 口径；其底层与预览共用 _classify。
+        source_report = self.query_sources(vid)
+        source_map = {}
+        for event_sources in source_report['events']:
+            for station_sources in event_sources['stations']:
+                source_map[(event_sources['event_id'],
+                            station_sources['station'])] = station_sources['sources']
+        groups_out = []
+        waveform_refs = []
+
+        for group in approved_groups:
+            members = list(group['members'])
+            usage = group['usage']
+            key = group['group_key']
+            event_entries = []
+            group_refs = []
+
+            for eid in members:
+                event = event_map[eid]
+                ranges = _json_copy(event.get('ranges', {}))
+                source_ranges = []
+                event_refs = []
+                for station, intervals in ranges.items():
+                    report_sources = source_map.get((eid, station), [])
+                    for raw_lo, raw_hi in intervals:
+                        lo, hi = int(raw_lo), int(raw_hi)
+                        pieces = []
+                        for source in report_sources:
+                            alo, ahi = map(int, source['interval'])
+                            if lo <= alo and ahi <= hi:
+                                pieces.append(((alo, ahi), source['kind'],
+                                               source['reference']))
+                        pieces.sort(key=lambda item: item[0])
+                        cursor = lo
+                        for (alo, ahi), kind, receipt_id in pieces:
+                            if alo > cursor:
+                                raise ReleaseRequestError(
+                                    f'refuse release {rid}: {eid} at {station} '
+                                    f'[{cursor},{alo}) has no source coverage')
+                            cursor = max(cursor, ahi)
+                            if kind != 'archive':
+                                raise ReleaseRequestError(
+                                    f'refuse release {rid}: {eid} at {station} '
+                                    f'[{alo},{ahi}) is not permanently archived')
+                            receipt = self._receipts[receipt_id]
+                            ref = {
+                                'release_request_id': rid,
+                                'group_key': key,
+                                'usage': usage,
+                                'event_id': eid,
+                                'station': station,
+                                'requested_range': [lo, hi],
+                                'interval': [alo, ahi],
+                                'range': [alo, ahi],
+                                'source': 'archive',
+                                'kind': 'archive',
+                                'receipt_id': receipt_id,
+                                'reference': receipt_id,
+                                'block_id': receipt['block_id'],
+                                'receipt_interval': [int(x) for x in receipt['interval']],
+                            }
+                            event_refs.append(ref)
+                            group_refs.append(ref)
+                            waveform_refs.append(ref)
+                            sources_entry = {
+                                'interval': [alo, ahi],
+                                'kind': 'archive',
+                                'reference': receipt_id,
+                                'receipt_id': receipt_id,
+                                'block_id': receipt['block_id'],
+                            }
+                        if cursor != hi:
+                            raise ReleaseRequestError(
+                                f'refuse release {rid}: {eid} at {station} '
+                                f'[{cursor},{hi}) has no source coverage')
+                        source_ranges.append({
+                            'station': station,
+                            'range': [lo, hi],
+                            'sources': [
+                                {'interval': [alo, ahi], 'kind': 'archive',
+                                 'reference': receipt_id, 'receipt_id': receipt_id}
+                                for (alo, ahi), _, receipt_id in pieces
+                            ],
+                        })
+                event_entries.append({
+                    'event_id': eid,
+                    'ranges': ranges,
+                    'source_ranges': source_ranges,
+                    'archive_refs': event_refs,
+                    'waveform_refs': event_refs,
+                })
+
+            groups_out.append({
+                'id': key,
+                'name': key,
+                'label': key,
+                'group_key': key,
+                'key': key,
+                'group_id': key,
+                'canonical_key': key,
+                'members': members,
+                'canonical_members': members,
+                'canonical_event_ids': members,
+                'member_ids': members,
+                'event_ids': members,
+                'usage': usage,
+                'treatment': usage,
+                'dataset': usage,
+                'split': usage,
+                'use': usage,
+                'purpose': usage,
+                'action': usage,
+                'decision': usage,
+                'state': usage,
+                'status': usage,
+                'sample_unions': group['sample_unions'],
+                'required_ranges': group['required_ranges'],
+                'events': event_entries,
+                'archive_refs': group_refs,
+                'waveform_refs': group_refs,
+            })
+
+        return {
+            'schema': RELEASE_MANIFEST_SCHEMA,
+            'kind': 'dataset_release_manifest',
+            'release_request_id': rid,
+            'request_id': rid,
+            'directory': semantic['directory'],
+            'version_id': vid,
+            'version': vid,
+            'candidate_event_ids': list(event_ids),
+            'candidates': list(event_ids),
+            'event_ids': list(event_ids),
+            'blind_event_ids': list(blind_ids),
+            'blind_ids': list(blind_ids),
+            'groups': groups_out,
+            'approved_group_keys': [g['group_key'] for g in groups_out],
+            'selected_group_keys': [g['group_key'] for g in groups_out],
+            'released_group_keys': [g['group_key'] for g in groups_out],
+            'archive_refs': waveform_refs,
+            'sources': waveform_refs,
+            'waveform_refs': waveform_refs,
+            'ref_count': len(waveform_refs),
+        }
+
+    def read_release(self, request_id):
+        """按发布请求 ID 读取首次成功发布时固定的清单；未知 ID 报错。"""
+        self._check_open()
+        rid = ident(request_id)
+        record = self._releases.get(rid)
+        if record is None:
+            raise UnknownReleaseError(f'no published release for request id {rid}')
+        return _wrap_usage_values(_json_copy(record['manifest']))
+
+    def get_release(self, request_id):
+        """读取已发布清单；未知请求 ID 返回 None。"""
+        return self.find_release(request_id)
+
+    def read_published_manifest(self, request_id):
+        return self.read_release(request_id)
+
+    def get_published_manifest(self, request_id):
+        return self.find_release(request_id)
+
+    def get_published_release(self, request_id):
+        return self.find_release(request_id)
+
+    def read_dataset_release(self, request_id):
+        return self.read_release(request_id)
+
+    def find_release(self, request_id):
+        """不抛异常的查询入口；未知 ID 返回 None。"""
+        self._check_open()
+        try:
+            rid = ident(request_id)
+        except ValueError:
+            return None
+        record = self._releases.get(rid)
+        return None if record is None else _wrap_usage_values(_json_copy(record['manifest']))
+
+    def list_releases(self):
+        """按请求 ID 字典序列出已成功发布的请求 ID。"""
+        self._check_open()
+        return sorted(self._releases)
+
+    # 更短/近义 API 名：read_* 与既有 read_plan 一样对未知 ID 报错；
+    # get_*/find_* 对未知 ID 返回 None。
+    read_manifest = read_release
+    manifest = read_release
+    get_manifest = find_release
+    get_release_manifest = find_release
+    read_release_manifest = read_release
+    get_published = find_release
+    published_manifest = find_release
+    preview = preview_release
+    release_preview = preview_release
+    publish = publish_release
+    release = publish_release
+    publish_manifest = publish_release
+    commit_dataset_release = publish_release
+
+    @property
+    def ledger(self):
+        return ReleaseLedger(self)
+
+    def release_ledger(self):
+        return ReleaseLedger(self)
+
     # ---------- 查询 ----------
 
     def block_status(self, block_id):
@@ -656,3 +1743,112 @@ class ReviewDirectory:
         out.extend((iv, 'missing', None) for iv in missing)
         out.sort(key=lambda item: (item[0][0], item[0][1], item[1], item[2] or ''))
         return out
+
+
+class ReleaseLedger:
+    """面向单个复核目录的发布账本薄封装。
+
+    也可以直接调用 ``ReviewDirectory.preview_release`` /
+    ``publish_release`` / ``read_release``；本类仅提供 ``preview``、
+    ``publish``、``get`` 这组短方法名。
+    """
+
+    def __init__(self, source):
+        if isinstance(source, ReviewDirectory):
+            self.directory = source
+            self._owns_directory = False
+        elif isinstance(source, (str, Path)):
+            self.directory = open_review(source)
+            self._owns_directory = True
+        else:
+            raise ReleaseRequestError(
+                'ReleaseLedger requires an open ReviewDirectory or directory path')
+
+    def close(self):
+        if self._owns_directory:
+            self.directory.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __getattr__(self, name):
+        # 允许账本薄封装直接暴露 ReviewDirectory 上的完整具名 API。
+        if name == 'directory' or 'directory' not in self.__dict__:
+            raise AttributeError(name)
+        return getattr(self.__dict__['directory'], name)
+
+    @classmethod
+    def open(cls, source):
+        return cls(source)
+
+    def preview(self, *args, **kwargs):
+        return self.directory.preview_release(*args, **kwargs)
+
+    def publish(self, *args, **kwargs):
+        return self.directory.publish_release(*args, **kwargs)
+
+    def get(self, request_id):
+        return self.directory.read_release(request_id)
+
+    def read(self, request_id):
+        return self.directory.read_release(request_id)
+
+    def find(self, request_id):
+        return self.directory.find_release(request_id)
+
+
+DatasetReleaseLedger = ReleaseLedger
+ReleaseBook = ReleaseLedger
+
+
+def _as_directory(directory):
+    if isinstance(directory, ReviewDirectory):
+        return directory, False
+    return open_review(directory), True
+
+
+def preview_release(directory, *args, **kwargs):
+    """模块级预览入口；可传已打开句柄或复核目录路径。"""
+    handle, should_close = _as_directory(directory)
+    try:
+        return handle.preview_release(*args, **kwargs)
+    finally:
+        if should_close:
+            handle.close()
+
+
+def publish_release(directory, *args, **kwargs):
+    """模块级发布入口；可传已打开句柄或复核目录路径。"""
+    handle, should_close = _as_directory(directory)
+    try:
+        return handle.publish_release(*args, **kwargs)
+    finally:
+        if should_close:
+            handle.close()
+
+
+def read_release(directory, request_id):
+    handle, should_close = _as_directory(directory)
+    try:
+        return handle.read_release(request_id)
+    finally:
+        if should_close:
+            handle.close()
+
+
+def get_published_manifest(directory, request_id):
+    handle, should_close = _as_directory(directory)
+    try:
+        return handle.find_release(request_id)
+    finally:
+        if should_close:
+            handle.close()
+
+
+preview_dataset_release = preview_release
+publish_dataset_release = publish_release
+read_published_manifest = read_release
+get_release = get_published_manifest
