@@ -30,3 +30,15 @@ def vector(value,size):return tuple(number(x) for x in array(value,size,size))
 def integer(value, low, high):
     if type(value) is not int or not low<=value<=high: raise ValueError('bounded integer required')
     return value
+
+def fraction_str(value):
+    """把 Fraction 精确渲染为十进制字符串；除不尽时沿用 n/d 口径。布尔值不接受。"""
+    if not isinstance(value,Fraction):raise ValueError('fraction required')
+    sign='-' if value<0 else '';v=abs(value);whole,rem=divmod(v.numerator,v.denominator)
+    if rem==0:return f'{sign}{whole}'
+    q=v.denominator;tail=0
+    while q%2==0:q//=2;tail+=1
+    while q%5==0:q//=5;tail+=1
+    if q!=1:return str(value)
+    digits=rem*10**tail//v.denominator
+    return f'{sign}{whole}.{str(digits).zfill(tail)}'
